@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .routes import invoices
 from .database import Base, engine
 from . import models
-from .routes import products, shops, sales, customers, credit
+from .routes import products, shops, sales, customers, credit, stock_advisor
 Base.metadata.create_all(bind=engine)
 
 
@@ -29,6 +29,7 @@ app.include_router(sales.router)
 app.include_router(customers.router)
 app.include_router(credit.router)
 app.include_router(invoices.router)
+app.include_router(stock_advisor.router)
 
 @app.get("/")
 def root():

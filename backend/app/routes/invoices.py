@@ -44,19 +44,20 @@ def create_invoice(
                 detail="Sale not found"
             )
 
-    # Generate the next invoice number
-    last_invoice = db.query(Invoice).filter(
+    # Generate the next invoice number (per shop, based on existing numbers)
+    existing_numbers = db.query(Invoice.invoice_number).filter(
         Invoice.shop_id == invoice_data.shop_id
-    ).order_by(
-        Invoice.id.desc()
-    ).first()
+    ).all()
 
-    if last_invoice:
-        next_number = last_invoice.id + 1
-    else:
-        next_number = 1
+    max_sequence = 0
 
-    invoice_number = f"INV-{next_number:06d}"
+    for (number,) in existing_numbers:
+        try:
+            max_sequence = max(max_sequence, int(number.split("-")[1]))
+        except (IndexError, ValueError):
+            continue
+
+    invoice_number = f"INV-{max_sequence + 1:06d}"
 
     invoice = Invoice(
         shop_id=invoice_data.shop_id,
@@ -109,18 +110,18 @@ def get_invoices(
 
                 product = db.query(Product).filter(
                     Product.id == item.product_id
-            ).first()
+                ).first()
 
-            items.append({
-                "product_id": item.product_id,
-                "brand": product.brand if product else None,
-                "name": product.name if product else None,
-                "variant": product.variant if product else None,
-                "pack_size": product.pack_size if product else None,
-                "quantity": item.quantity,
-                "unit_price": item.unit_price,
-                "total_price": item.total_price
-            })
+                items.append({
+                    "product_id": item.product_id,
+                    "brand": product.brand if product else None,
+                    "name": product.name if product else None,
+                    "variant": product.variant if product else None,
+                    "pack_size": product.pack_size if product else None,
+                    "quantity": item.quantity,
+                    "unit_price": item.unit_price,
+                    "total_price": item.total_price
+                })
 
         result.append({
             "id": invoice.id,
