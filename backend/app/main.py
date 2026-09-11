@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .. import invoices
+from .routes import invoices
 from .database import Base, engine
 from . import models
 from .routes import products, shops, sales, customers, credit

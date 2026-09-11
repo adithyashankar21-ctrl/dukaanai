@@ -5,10 +5,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
-from .app.database import get_db
-from .app.models import Invoice, Shop, Sale, Customer, Product
-from .app.schemas import InvoiceCreate, InvoiceResponse
-from ..invoice_pdf import generate_invoice_pdf
+from ..database import get_db
+from ..models import Invoice, Shop, Sale, Customer, Product
+from ..schemas import InvoiceCreate, InvoiceResponse
+from .invoice_pdf import generate_invoice_pdf
 
 
 router = APIRouter(
