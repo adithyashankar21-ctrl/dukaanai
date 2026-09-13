@@ -20,7 +20,8 @@
   --coral: #fb7d64;
   --coral-deep: #e8563a;
 
-  --card: #ffffff;
+  --card: rgba(255, 255, 255, 0.86);
+  --card-solid: #ffffff;
   --line: rgba(33, 29, 43, 0.08);
   --line-strong: rgba(33, 29, 43, 0.14);
 

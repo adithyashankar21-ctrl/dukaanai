@@ -1,13 +1,12 @@
-from datetime import datetime
-import os
+import io
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..models import Invoice, Shop, Sale, Customer, Product
 from ..schemas import InvoiceCreate, InvoiceResponse
+from ..services import invoice_ai_service, invoice_service
 from .invoice_pdf import generate_invoice_pdf
 
 
@@ -17,130 +16,76 @@ router = APIRouter(
 )
 
 
+def _pdf_response(db: Session, invoice) -> Response:
+    invoice_data = invoice_service.serialize_invoice(db, invoice)
+    note = invoice_ai_service.generate_thank_you_note(invoice_data)
+
+    buffer = io.BytesIO()
+    generate_invoice_pdf(invoice_data, buffer, note=note)
+
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{invoice.invoice_number}.pdf"'},
+    )
+
+
 @router.post("/", response_model=InvoiceResponse)
 def create_invoice(
     invoice_data: InvoiceCreate,
     db: Session = Depends(get_db)
 ):
-    shop = db.query(Shop).filter(
-        Shop.id == invoice_data.shop_id
-    ).first()
-
-    if not shop:
-        raise HTTPException(
-            status_code=404,
-            detail="Shop not found"
+    try:
+        return invoice_service.create_invoice(
+            db,
+            invoice_data.shop_id,
+            customer_id=invoice_data.customer_id,
+            sale_id=invoice_data.sale_id,
+            total_amount=invoice_data.total_amount,
+            payment_method=invoice_data.payment_method,
+            status=invoice_data.status,
         )
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    if invoice_data.sale_id:
-        sale = db.query(Sale).filter(
-            Sale.id == invoice_data.sale_id,
-            Sale.shop_id == invoice_data.shop_id
-        ).first()
-
-        if not sale:
-            raise HTTPException(
-                status_code=404,
-                detail="Sale not found"
-            )
-
-    # Generate the next invoice number (per shop, based on existing numbers)
-    existing_numbers = db.query(Invoice.invoice_number).filter(
-        Invoice.shop_id == invoice_data.shop_id
-    ).all()
-
-    max_sequence = 0
-
-    for (number,) in existing_numbers:
-        try:
-            max_sequence = max(max_sequence, int(number.split("-")[1]))
-        except (IndexError, ValueError):
-            continue
-
-    invoice_number = f"INV-{max_sequence + 1:06d}"
-
-    invoice = Invoice(
-        shop_id=invoice_data.shop_id,
-        customer_id=invoice_data.customer_id,
-        sale_id=invoice_data.sale_id,
-        invoice_number=invoice_number,
-        total_amount=invoice_data.total_amount,
-        payment_method=invoice_data.payment_method,
-        status=invoice_data.status,
-        created_at=datetime.now().isoformat()
-    )
-
-    db.add(invoice)
-    db.commit()
-    db.refresh(invoice)
-
-    return invoice
 
 @router.get("/")
 def get_invoices(
     shop_id: int,
     db: Session = Depends(get_db)
 ):
-    invoices = db.query(Invoice).filter(
-        Invoice.shop_id == shop_id
-    ).order_by(
-        Invoice.id.desc()
-    ).all()
+    return invoice_service.list_invoices(db, shop_id)
 
-    result = []
 
-    for invoice in invoices:
+@router.get("/by-number/{invoice_number}")
+def get_invoice_by_number(
+    invoice_number: str,
+    shop_id: int,
+    db: Session = Depends(get_db)
+):
+    try:
+        invoice = invoice_service.get_invoice_by_number(db, shop_id, invoice_number)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
-        customer = None
-        if invoice.customer_id:
-            customer = db.query(Customer).filter(
-                Customer.id == invoice.customer_id
-            ).first()
+    return invoice_service.serialize_invoice(db, invoice)
 
-        sale = None
-        if invoice.sale_id:
-            sale = db.query(Sale).filter(
-                Sale.id == invoice.sale_id
-            ).first()
 
-        items = []
+@router.get("/by-number/{invoice_number}/pdf")
+def generate_invoice_by_number(
+    invoice_number: str,
+    shop_id: int,
+    db: Session = Depends(get_db)
+):
+    try:
+        invoice = invoice_service.get_invoice_by_number(db, shop_id, invoice_number)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
-        if sale:
-            for item in sale.items:
+    return _pdf_response(db, invoice)
 
-                product = db.query(Product).filter(
-                    Product.id == item.product_id
-                ).first()
-
-                items.append({
-                    "product_id": item.product_id,
-                    "brand": product.brand if product else None,
-                    "name": product.name if product else None,
-                    "variant": product.variant if product else None,
-                    "pack_size": product.pack_size if product else None,
-                    "quantity": item.quantity,
-                    "unit_price": item.unit_price,
-                    "total_price": item.total_price
-                })
-
-        result.append({
-            "id": invoice.id,
-            "invoice_number": invoice.invoice_number,
-            "shop_id": invoice.shop_id,
-            "customer": {
-                "id": customer.id,
-                "name": customer.name,
-                "phone": customer.phone
-            } if customer else None,
-            "sale_id": invoice.sale_id,
-            "items": items,
-            "total_amount": invoice.total_amount,
-            "payment_method": invoice.payment_method,
-            "status": invoice.status,
-            "created_at": invoice.created_at
-        })
-
-    return result
 
 @router.get("/{invoice_id}")
 def get_invoice(
@@ -148,140 +93,23 @@ def get_invoice(
     shop_id: int,
     db: Session = Depends(get_db)
 ):
-    invoice = db.query(Invoice).filter(
-        Invoice.id == invoice_id,
-        Invoice.shop_id == shop_id
-    ).first()
+    try:
+        invoice = invoice_service.get_invoice(db, shop_id, invoice_id)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
-    if not invoice:
-        raise HTTPException(
-            status_code=404,
-            detail="Invoice not found"
-        )
+    return invoice_service.serialize_invoice(db, invoice)
 
-    customer = None
 
-    if invoice.customer_id:
-        customer = db.query(Customer).filter(
-            Customer.id == invoice.customer_id
-        ).first()
-
-    sale = None
-
-    if invoice.sale_id:
-        sale = db.query(Sale).filter(
-            Sale.id == invoice.sale_id
-        ).first()
-
-    items = []
-
-    if sale:
-        for item in sale.items:
-
-            product = db.query(Product).filter(
-                Product.id == item.product_id
-            ).first()
-
-            items.append({
-                "product_id": item.product_id,
-                "brand": product.brand if product else None,
-                "name": product.name if product else None,
-                "variant": product.variant if product else None,
-                "pack_size": product.pack_size if product else None,
-                "quantity": item.quantity,
-                "unit_price": item.unit_price,
-                "total_price": item.total_price
-            })
-
-    return {
-        "id": invoice.id,
-        "invoice_number": invoice.invoice_number,
-        "shop_id": invoice.shop_id,
-        "customer": {
-            "id": customer.id,
-            "name": customer.name,
-            "phone": customer.phone
-        } if customer else None,
-        "sale_id": invoice.sale_id,
-        "items": items,
-        "total_amount": invoice.total_amount,
-        "payment_method": invoice.payment_method,
-        "status": invoice.status,
-        "created_at": invoice.created_at
-    }
 @router.get("/{invoice_id}/pdf")
 def generate_invoice(
     invoice_id: int,
     shop_id: int,
     db: Session = Depends(get_db)
 ):
-    invoice = db.query(Invoice).filter(
-        Invoice.id == invoice_id,
-        Invoice.shop_id == shop_id
-    ).first()
+    try:
+        invoice = invoice_service.get_invoice(db, shop_id, invoice_id)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
-    if not invoice:
-        raise HTTPException(
-            status_code=404,
-            detail="Invoice not found"
-        )
-
-    customer = None
-
-    if invoice.customer_id:
-        customer = db.query(Customer).filter(
-            Customer.id == invoice.customer_id
-        ).first()
-
-    sale = None
-
-    if invoice.sale_id:
-        sale = db.query(Sale).filter(
-            Sale.id == invoice.sale_id
-        ).first()
-
-    items = []
-
-    if sale:
-        for item in sale.items:
-
-            product = db.query(Product).filter(
-                Product.id == item.product_id
-            ).first()
-
-            items.append({
-                "product_id": item.product_id,
-                "brand": product.brand if product else None,
-                "name": product.name if product else None,
-                "variant": product.variant if product else None,
-                "pack_size": product.pack_size if product else None,
-                "quantity": item.quantity,
-                "unit_price": item.unit_price,
-                "total_price": item.total_price
-            })
-
-    invoice_data = {
-        "invoice_number": invoice.invoice_number,
-        "created_at": invoice.created_at,
-        "customer": {
-            "id": customer.id,
-            "name": customer.name,
-            "phone": customer.phone
-        } if customer else None,
-        "items": items,
-        "total_amount": invoice.total_amount,
-        "payment_method": invoice.payment_method
-    }
-
-    file_path = f"invoice_{invoice.invoice_number}.pdf"
-
-    generate_invoice_pdf(
-        invoice_data,
-        file_path
-    )
-
-    return FileResponse(
-        path=file_path,
-        media_type="application/pdf",
-        filename=file_path
-    )
+    return _pdf_response(db, invoice)

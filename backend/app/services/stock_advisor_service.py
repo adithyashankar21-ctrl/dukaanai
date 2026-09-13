@@ -293,6 +293,31 @@ def _timeline_sentence(timeline: dict, lead_time_days: int) -> str:
 
 # --- Shop-level AI analysis ------------------------------------------------
 
+ATTENTION_URGENCIES = {URGENCY_CRITICAL, URGENCY_ORDER_SOON, URGENCY_WATCH}
+ATTENTION_RECOMMENDATIONS = {RECOMMEND_ORDER_NOW, RECOMMEND_BUY_MORE}
+
+
+def _needs_attention(
+    recommendation: str,
+    urgency: str,
+    demand_trend: str,
+    current_stock: int,
+    reorder_point: int,
+) -> bool:
+    """Whether this product actually belongs in front of the shopkeeper right
+    now. Most products, most of the time, are simply fine — well-stocked,
+    selling at a steady pace — and showing every single one in the advisor
+    (including one that just got restocked) buries the ones that matter.
+    Only flag genuine issues: low/about-to-finish stock, a delayed-looking
+    reorder, or so much slow-moving stock it is worth a return/promo."""
+    if recommendation in ATTENTION_RECOMMENDATIONS:
+        return True
+    if urgency in ATTENTION_URGENCIES:
+        return True
+    if demand_trend == TREND_DECREASING and reorder_point > 0 and current_stock >= reorder_point * 4:
+        return True
+    return False
+
 
 def _at_risk_products(recommendations: list[dict]) -> list[str]:
     """Products whose stockout arrives before an order could arrive."""
@@ -459,6 +484,168 @@ def _shop_analysis(
     return {"health_score": health, "insights": insights}
 
 
+def _analyze_product_row(
+    product: Product,
+    last7: int,
+    prev7: int,
+    lead: int,
+    now: datetime,
+) -> dict:
+    """The full AI analysis for one product ID, independent of every other
+    product in the shop. Shared by the whole-shop advisor and the single-
+    product barcode-scan lookup so the numbers are always computed the same
+    way in both places."""
+    display_name = _build_display_name(product)
+
+    avg_daily = round(last7 / 7.0, 1)
+    trend, growth = _trend_and_growth(last7, prev7)
+    rate = _demand_rate(last7, growth)
+
+    if avg_daily > 0:
+        days_until_stockout = round(product.current_stock / avg_daily, 1)
+    else:
+        days_until_stockout = None
+
+    reorder_point = ceil(rate * (lead + SAFETY_STOCK_DAYS))
+
+    total_14d = last7 + prev7
+    if total_14d < MIN_UNITS_FOR_PREDICTION:
+        recommendation = RECOMMEND_INSUFFICIENT
+    else:
+        recommendation = _recommendation(
+            product.current_stock,
+            reorder_point,
+            days_until_stockout,
+            trend,
+            lead,
+        )
+
+    order_qty = _order_quantity(
+        recommendation,
+        product.current_stock,
+        rate,
+        lead,
+    )
+
+    explanation = _explanation(
+        recommendation,
+        display_name,
+        product.current_stock,
+        avg_daily,
+        days_until_stockout,
+        trend,
+        growth,
+        reorder_point,
+        order_qty,
+        lead,
+    )
+
+    timeline = _stockout_timeline(
+        product.current_stock,
+        avg_daily,
+        lead,
+        now,
+    )
+
+    timeline_sentence = _timeline_sentence(timeline, lead)
+
+    margin = None
+    margin_percent = None
+    if product.purchase_price is not None:
+        margin = round(product.selling_price - product.purchase_price, 2)
+        if product.selling_price:
+            margin_percent = round(margin / product.selling_price * 100, 1)
+
+    return {
+        "product_id": product.id,
+        "brand": product.brand,
+        "name": product.name,
+        "variant": product.variant,
+        "pack_size": product.pack_size,
+        "display_name": display_name,
+        "current_stock": product.current_stock,
+        "selling_price": product.selling_price,
+        "purchase_price": product.purchase_price,
+        "margin": margin,
+        "margin_percent": margin_percent,
+        "units_sold_last_7_days": last7,
+        "units_sold_prev_7_days": prev7,
+        "avg_daily_sales": avg_daily,
+        "sales_growth_percent": growth,
+        "demand_trend": trend,
+        "days_until_stockout": days_until_stockout,
+        "reorder_point": reorder_point,
+        "recommended_order_quantity": order_qty,
+        "recommendation": recommendation,
+        "explanation": explanation,
+        "stockout_date": timeline["stockout_date"],
+        "order_by_date": timeline["order_by_date"],
+        "days_until_order_by": timeline["days_until_order_by"],
+        "urgency": timeline["urgency"],
+        "timeline": timeline_sentence,
+        "needs_attention": _needs_attention(
+            recommendation, timeline["urgency"], trend, product.current_stock, reorder_point
+        ),
+    }
+
+
+def _sales_last_14_days(
+    db: Session,
+    shop_id: int,
+    now: datetime,
+    product_id: int | None = None,
+) -> tuple[dict[int, int], dict[int, int]]:
+    """units sold in the last 7 days and the 7 days before that, per product."""
+    start_7d = (now - timedelta(days=7)).isoformat()
+    start_14d = (now - timedelta(days=14)).isoformat()
+
+    q = (
+        db.query(
+            SaleItem.product_id,
+            SaleItem.quantity,
+            Sale.created_at,
+        )
+        .join(Sale, SaleItem.sale_id == Sale.id)
+        .filter(
+            Sale.shop_id == shop_id,
+            Sale.created_at >= start_14d,
+        )
+    )
+    if product_id is not None:
+        q = q.filter(SaleItem.product_id == product_id)
+
+    last7_units: dict[int, int] = {}
+    prev7_units: dict[int, int] = {}
+
+    for pid, quantity, created_at in q.all():
+        if created_at >= start_7d:
+            last7_units[pid] = last7_units.get(pid, 0) + quantity
+        else:
+            prev7_units[pid] = prev7_units.get(pid, 0) + quantity
+
+    return last7_units, prev7_units
+
+
+def analyze_product(
+    db: Session,
+    shop_id: int,
+    product: Product,
+    lead_time_days: int | None = None,
+) -> dict:
+    """The same per-product analysis as analyze_shop_stock, for one product
+    that's already been resolved (e.g. by barcode scan)."""
+    lead = lead_time_days or DEFAULT_SUPPLIER_LEAD_TIME_DAYS
+    now = datetime.now()
+
+    last7_units, prev7_units = _sales_last_14_days(db, shop_id, now, product_id=product.id)
+    last7 = last7_units.get(product.id, 0)
+    prev7 = prev7_units.get(product.id, 0)
+
+    result = _analyze_product_row(product, last7, prev7, lead, now)
+    result["disclaimer"] = DISCLAIMER
+    return result
+
+
 def analyze_shop_stock(
     db: Session,
     shop_id: int,
@@ -474,116 +661,18 @@ def analyze_shop_stock(
     )
 
     now = datetime.now()
-    start_7d = (now - timedelta(days=7)).isoformat()
-    start_14d = (now - timedelta(days=14)).isoformat()
+    last7_units, prev7_units = _sales_last_14_days(db, shop_id, now)
 
-    # One query for all sale items in the last 14 days for this shop.
-    rows = (
-        db.query(
-            SaleItem.product_id,
-            SaleItem.quantity,
-            Sale.created_at,
-        )
-        .join(Sale, SaleItem.sale_id == Sale.id)
-        .filter(
-            Sale.shop_id == shop_id,
-            Sale.created_at >= start_14d,
-        )
-        .all()
-    )
-
-    last7_units: dict[int, int] = {}
-    prev7_units: dict[int, int] = {}
-
-    for product_id, quantity, created_at in rows:
-        if created_at >= start_7d:
-            last7_units[product_id] = last7_units.get(product_id, 0) + quantity
-        else:
-            prev7_units[product_id] = prev7_units.get(product_id, 0) + quantity
-
-    recommendations: list[dict] = []
-
-    for product in products:
-        last7 = last7_units.get(product.id, 0)
-        prev7 = prev7_units.get(product.id, 0)
-        display_name = _build_display_name(product)
-
-        avg_daily = round(last7 / 7.0, 1)
-        trend, growth = _trend_and_growth(last7, prev7)
-        rate = _demand_rate(last7, growth)
-
-        if avg_daily > 0:
-            days_until_stockout = round(product.current_stock / avg_daily, 1)
-        else:
-            days_until_stockout = None
-
-        reorder_point = ceil(rate * (lead + SAFETY_STOCK_DAYS))
-
-        total_14d = last7 + prev7
-        if total_14d < MIN_UNITS_FOR_PREDICTION:
-            recommendation = RECOMMEND_INSUFFICIENT
-        else:
-            recommendation = _recommendation(
-                product.current_stock,
-                reorder_point,
-                days_until_stockout,
-                trend,
-                lead,
-            )
-
-        order_qty = _order_quantity(
-            recommendation,
-            product.current_stock,
-            rate,
-            lead,
-        )
-
-        explanation = _explanation(
-            recommendation,
-            display_name,
-            product.current_stock,
-            avg_daily,
-            days_until_stockout,
-            trend,
-            growth,
-            reorder_point,
-            order_qty,
-            lead,
-        )
-
-        timeline = _stockout_timeline(
-            product.current_stock,
-            avg_daily,
+    recommendations: list[dict] = [
+        _analyze_product_row(
+            product,
+            last7_units.get(product.id, 0),
+            prev7_units.get(product.id, 0),
             lead,
             now,
         )
-
-        timeline_sentence = _timeline_sentence(timeline, lead)
-
-        recommendations.append({
-            "product_id": product.id,
-            "brand": product.brand,
-            "name": product.name,
-            "variant": product.variant,
-            "pack_size": product.pack_size,
-            "display_name": display_name,
-            "current_stock": product.current_stock,
-            "units_sold_last_7_days": last7,
-            "units_sold_prev_7_days": prev7,
-            "avg_daily_sales": avg_daily,
-            "sales_growth_percent": growth,
-            "demand_trend": trend,
-            "days_until_stockout": days_until_stockout,
-            "reorder_point": reorder_point,
-            "recommended_order_quantity": order_qty,
-            "recommendation": recommendation,
-            "explanation": explanation,
-            "stockout_date": timeline["stockout_date"],
-            "order_by_date": timeline["order_by_date"],
-            "days_until_order_by": timeline["days_until_order_by"],
-            "urgency": timeline["urgency"],
-            "timeline": timeline_sentence,
-        })
+        for product in products
+    ]
 
     summary = {
         "total_products": len(recommendations),
@@ -605,6 +694,7 @@ def analyze_shop_stock(
             1 for r in recommendations
             if r["recommendation"] == RECOMMEND_INSUFFICIENT
         ),
+        "needs_attention": sum(1 for r in recommendations if r["needs_attention"]),
     }
 
     shop_level = _shop_analysis(recommendations, lead, now)

@@ -171,6 +171,37 @@ class CreditTransaction(Base):
         String,
         nullable=False
     )
+class StockAdjustment(Base):
+    __tablename__ = "stock_adjustments"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    shop_id = Column(
+        Integer,
+        ForeignKey("shops.id"),
+        nullable=False
+    )
+
+    product_id = Column(
+        Integer,
+        ForeignKey("products.id"),
+        nullable=False
+    )
+
+    delta = Column(Integer, nullable=False)
+
+    adjustment_type = Column(
+        String,
+        nullable=False
+    )
+
+    reason = Column(String, nullable=True)
+    supplier = Column(String, nullable=True)
+    unit_cost = Column(Float, nullable=True)
+
+    created_at = Column(String, nullable=False)
+
+
 class Invoice(Base):
     __tablename__ = "invoices"
 

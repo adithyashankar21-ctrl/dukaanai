@@ -84,6 +84,32 @@ class InvoiceCreate(BaseModel):
     status: str = "paid"
 
 
+class StockAdjustmentCreate(BaseModel):
+    shop_id: int
+    product_id: int
+    delta: int
+    adjustment_type: str = "correction"
+    reason: Optional[str] = None
+    supplier: Optional[str] = None
+    unit_cost: Optional[float] = None
+    confirmed: bool = False
+
+
+class PriceUpdate(BaseModel):
+    shop_id: int
+    selling_price: Optional[float] = None
+    purchase_price: Optional[float] = None
+    selling_price_delta: Optional[float] = None
+    purchase_price_delta: Optional[float] = None
+
+
+class VoiceCommand(BaseModel):
+    shop_id: int
+    session_id: Optional[str] = None
+    text: str
+    context_product_id: Optional[int] = None
+
+
 class InvoiceResponse(BaseModel):
     id: int
     shop_id: int
